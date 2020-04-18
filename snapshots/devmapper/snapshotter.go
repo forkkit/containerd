@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/plugin"
@@ -303,19 +304,32 @@ func (s *Snapshotter) removeDevice(ctx context.Context, key string) error {
 	}
 
 	deviceName := s.getDeviceName(snapID)
-	if err := s.pool.RemoveDevice(ctx, deviceName); err != nil {
-		log.G(ctx).WithError(err).Errorf("failed to remove device")
-		return err
+	if !s.config.AsyncRemove {
+		if err := s.pool.RemoveDevice(ctx, deviceName); err != nil {
+			log.G(ctx).WithError(err).Errorf("failed to remove device")
+			// Tell snapshot GC continue to collect other snapshots.
+			// Otherwise, one snapshot collection failure will stop
+			// the GC, and all snapshots won't be collected even though
+			// having no relationship with the failed one.
+			return errdefs.ErrFailedPrecondition
+		}
+	} else {
+		// The asynchronous cleanup will do the real device remove work.
+		log.G(ctx).WithField("device", deviceName).Debug("async remove")
+		if err := s.pool.MarkDeviceState(ctx, deviceName, Removed); err != nil {
+			log.G(ctx).WithError(err).Errorf("failed to mark device as removed")
+			return err
+		}
 	}
 
 	return nil
 }
 
 // Walk iterates through all metadata Info for the stored snapshots and calls the provided function for each.
-func (s *Snapshotter) Walk(ctx context.Context, fn func(context.Context, snapshots.Info) error) error {
+func (s *Snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
 	log.G(ctx).Debug("walk")
 	return s.withTransaction(ctx, false, func(ctx context.Context) error {
-		return storage.WalkInfo(ctx, fn)
+		return storage.WalkInfo(ctx, fn, fs...)
 	})
 }
 
@@ -485,4 +499,35 @@ func (s *Snapshotter) withTransaction(ctx context.Context, writable bool, fn fun
 	}
 
 	return nil
+}
+
+func (s *Snapshotter) Cleanup(ctx context.Context) error {
+	var removedDevices []*DeviceInfo
+
+	if !s.config.AsyncRemove {
+		return nil
+	}
+
+	if err := s.pool.WalkDevices(ctx, func(info *DeviceInfo) error {
+		if info.State == Removed {
+			removedDevices = append(removedDevices, info)
+		}
+		return nil
+	}); err != nil {
+		log.G(ctx).WithError(err).Errorf("failed to query devices from metastore")
+		return err
+	}
+
+	var result *multierror.Error
+	for _, dev := range removedDevices {
+		log.G(ctx).WithField("device", dev.Name).Debug("cleanup device")
+		if err := s.pool.RemoveDevice(ctx, dev.Name); err != nil {
+			log.G(ctx).WithField("device", dev.Name).Error("failed to cleanup device")
+			result = multierror.Append(result, err)
+		} else {
+			log.G(ctx).WithField("device", dev.Name).Debug("cleanuped device")
+		}
+	}
+
+	return result.ErrorOrNil()
 }

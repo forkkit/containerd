@@ -31,8 +31,10 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/log"
+	distribution "github.com/containerd/containerd/reference/docker"
 	"github.com/containerd/containerd/remotes/docker"
-	distribution "github.com/docker/distribution/reference"
+	"github.com/containerd/imgcrypt"
+	"github.com/containerd/imgcrypt/images/encryption"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -106,7 +108,8 @@ func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 			return nil, nil
 		}
 	)
-	image, err := c.client.Pull(ctx, ref,
+
+	pullOpts := []containerd.RemoteOpt{
 		containerd.WithSchema1Conversion,
 		containerd.WithResolver(resolver),
 		containerd.WithPullSnapshotter(c.config.ContainerdConfig.Snapshotter),
@@ -114,7 +117,15 @@ func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 		containerd.WithPullLabel(imageLabelKey, imageLabelValue),
 		containerd.WithMaxConcurrentDownloads(c.config.MaxConcurrentDownloads),
 		containerd.WithImageHandler(imageHandler),
-	)
+	}
+
+	pullOpts = append(pullOpts, c.encryptedImagesPullOpts()...)
+	if !c.config.ContainerdConfig.DisableSnapshotAnnotations {
+		pullOpts = append(pullOpts,
+			containerd.WithImageHandlerWrapper(appendInfoHandlerWrapper(ref)))
+	}
+
+	image, err := c.client.Pull(ctx, ref, pullOpts...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to pull and unpack image %q", ref)
 	}
@@ -253,39 +264,41 @@ func (c *criService) updateImage(ctx context.Context, r string) error {
 // getTLSConfig returns a TLSConfig configured with a CA/Cert/Key specified by registryTLSConfig
 func (c *criService) getTLSConfig(registryTLSConfig criconfig.TLSConfig) (*tls.Config, error) {
 	var (
-		cert tls.Certificate
-		err  error
+		tlsConfig = &tls.Config{}
+		cert      tls.Certificate
+		err       error
 	)
-	if registryTLSConfig.CertFile != "" && registryTLSConfig.KeyFile != "" {
-		cert, err = tls.LoadX509KeyPair(registryTLSConfig.CertFile, registryTLSConfig.KeyFile)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to load cert file")
-		}
-	}
 	if registryTLSConfig.CertFile != "" && registryTLSConfig.KeyFile == "" {
 		return nil, errors.Errorf("cert file %q was specified, but no corresponding key file was specified", registryTLSConfig.CertFile)
 	}
 	if registryTLSConfig.CertFile == "" && registryTLSConfig.KeyFile != "" {
 		return nil, errors.Errorf("key file %q was specified, but no corresponding cert file was specified", registryTLSConfig.KeyFile)
 	}
+	if registryTLSConfig.CertFile != "" && registryTLSConfig.KeyFile != "" {
+		cert, err = tls.LoadX509KeyPair(registryTLSConfig.CertFile, registryTLSConfig.KeyFile)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load cert file")
+		}
+		if len(cert.Certificate) != 0 {
+			tlsConfig.Certificates = []tls.Certificate{cert}
+		}
+		tlsConfig.BuildNameToCertificate()
+	}
 
-	caCertPool, err := x509.SystemCertPool()
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get system cert pool")
+	if registryTLSConfig.CAFile != "" {
+		caCertPool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to get system cert pool")
+		}
+		caCert, err := ioutil.ReadFile(registryTLSConfig.CAFile)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load CA file")
+		}
+		caCertPool.AppendCertsFromPEM(caCert)
+		tlsConfig.RootCAs = caCertPool
 	}
-	caCert, err := ioutil.ReadFile(registryTLSConfig.CAFile)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to load CA file")
-	}
-	caCertPool.AppendCertsFromPEM(caCert)
 
-	tlsConfig := &tls.Config{
-		RootCAs: caCertPool,
-	}
-	if len(cert.Certificate) != 0 {
-		tlsConfig.Certificates = []tls.Certificate{cert}
-	}
-	tlsConfig.BuildNameToCertificate()
+	tlsConfig.InsecureSkipVerify = registryTLSConfig.InsecureSkipVerify
 	return tlsConfig, nil
 }
 
@@ -346,6 +359,17 @@ func (c *criService) registryHosts(auth *runtime.AuthConfig) docker.RegistryHost
 	}
 }
 
+// defaultScheme returns the default scheme for a registry host.
+func defaultScheme(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return "http"
+	}
+	return "https"
+}
+
 // registryEndpoints returns endpoints for a given host.
 // It adds default registry endpoint if it does not exist in the passed-in endpoint list.
 // It also supports wildcard host matching with `*`.
@@ -371,7 +395,7 @@ func (c *criService) registryEndpoints(host string) ([]string, error) {
 			return endpoints, nil
 		}
 	}
-	return append(endpoints, "https://"+defaultHost), nil
+	return append(endpoints, defaultScheme(defaultHost)+"://"+defaultHost), nil
 }
 
 // newTransport returns a new HTTP transport used to pull image.
@@ -388,5 +412,56 @@ func newTransport() *http.Transport {
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
+	}
+}
+
+// encryptedImagesPullOpts returns the necessary list of pull options required
+// for decryption of encrypted images based on the cri decryption configuration.
+func (c *criService) encryptedImagesPullOpts() []containerd.RemoteOpt {
+	if c.config.ImageDecryption.KeyModel == criconfig.KeyModelNode {
+		ltdd := imgcrypt.Payload{}
+		decUnpackOpt := encryption.WithUnpackConfigApplyOpts(encryption.WithDecryptedUnpack(&ltdd))
+		opt := containerd.WithUnpackOpts([]containerd.UnpackOpt{decUnpackOpt})
+		return []containerd.RemoteOpt{opt}
+	}
+	return nil
+}
+
+const (
+	// targetRefLabel is a label which contains image reference and will be passed
+	// to snapshotters.
+	targetRefLabel = "containerd.io/snapshot/cri.image-ref"
+	// targetDigestLabel is a label which contains layer digest and will be passed
+	// to snapshotters.
+	targetDigestLabel = "containerd.io/snapshot/cri.layer-digest"
+)
+
+// appendInfoHandlerWrapper makes a handler which appends some basic information
+// of images to each layer descriptor as annotations during unpack. These
+// annotations will be passed to snapshotters as labels. These labels will be
+// used mainly by stargz-based snapshotters for querying image contents from the
+// registry.
+func appendInfoHandlerWrapper(ref string) func(f containerdimages.Handler) containerdimages.Handler {
+	return func(f containerdimages.Handler) containerdimages.Handler {
+		return containerdimages.HandlerFunc(func(ctx context.Context, desc imagespec.Descriptor) ([]imagespec.Descriptor, error) {
+			children, err := f.Handle(ctx, desc)
+			if err != nil {
+				return nil, err
+			}
+			switch desc.MediaType {
+			case imagespec.MediaTypeImageManifest, containerdimages.MediaTypeDockerSchema2Manifest:
+				for i := range children {
+					c := &children[i]
+					if containerdimages.IsLayerType(c.MediaType) {
+						if c.Annotations == nil {
+							c.Annotations = make(map[string]string)
+						}
+						c.Annotations[targetRefLabel] = ref
+						c.Annotations[targetDigestLabel] = c.Digest.String()
+					}
+				}
+			}
+			return children, nil
+		})
 	}
 }

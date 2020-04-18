@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/containerd/api/services/containers/v1"
 	"github.com/containerd/containerd/api/services/diff/v1"
 	"github.com/containerd/containerd/api/services/images/v1"
+	introspectionapi "github.com/containerd/containerd/api/services/introspection/v1"
 	"github.com/containerd/containerd/api/services/namespaces/v1"
 	"github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/content"
@@ -40,6 +41,7 @@ import (
 
 	criconfig "github.com/containerd/cri/pkg/config"
 	"github.com/containerd/cri/pkg/constants"
+	criplatforms "github.com/containerd/cri/pkg/containerd/platforms"
 	"github.com/containerd/cri/pkg/server"
 )
 
@@ -63,6 +65,10 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	ic.Meta.Exports = map[string]string{"CRIVersion": constants.CRIVersion}
 	ctx := ic.Context
 	pluginConfig := ic.Config.(*criconfig.PluginConfig)
+	if err := criconfig.ValidatePluginConfig(ctx, pluginConfig); err != nil {
+		return nil, errors.Wrap(err, "invalid plugin config")
+	}
+
 	c := criconfig.Config{
 		PluginConfig:       *pluginConfig,
 		ContainerdRootDir:  filepath.Dir(ic.Root),
@@ -71,10 +77,6 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 		StateDir:           ic.State,
 	}
 	log.G(ctx).Infof("Start cri plugin with config %+v", c)
-
-	if err := criconfig.ValidatePluginConfig(ctx, pluginConfig); err != nil {
-		return nil, errors.Wrap(err, "invalid plugin config")
-	}
 
 	if err := setGLogLevel(); err != nil {
 		return nil, errors.Wrap(err, "failed to set glog level")
@@ -89,6 +91,7 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	client, err := containerd.New(
 		"",
 		containerd.WithDefaultNamespace(constants.K8sContainerdNamespace),
+		containerd.WithDefaultPlatform(criplatforms.Default()),
 		containerd.WithServices(servicesOpts...),
 	)
 	if err != nil {
@@ -144,6 +147,9 @@ func getServicesOpts(ic *plugin.InitContext) ([]containerd.ServicesOpt, error) {
 		services.LeasesService: func(s interface{}) containerd.ServicesOpt {
 			return containerd.WithLeasesService(s.(leases.Manager))
 		},
+		services.IntrospectionService: func(s interface{}) containerd.ServicesOpt {
+			return containerd.WithIntrospectionService(s.(introspectionapi.IntrospectionClient))
+		},
 	} {
 		p := plugins[s]
 		if p == nil {
@@ -170,7 +176,7 @@ func setGLogLevel() error {
 		return err
 	}
 	switch l {
-	case log.TraceLevel:
+	case logrus.TraceLevel:
 		return fs.Set("v", "5")
 	case logrus.DebugLevel:
 		return fs.Set("v", "4")

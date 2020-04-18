@@ -22,7 +22,6 @@ import (
 	goruntime "runtime"
 
 	"github.com/containerd/containerd/log"
-	cni "github.com/containerd/go-cni"
 	"golang.org/x/net/context"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
@@ -41,11 +40,6 @@ func (c *criService) Status(ctx context.Context, r *runtime.StatusRequest) (*run
 	networkCondition := &runtime.RuntimeCondition{
 		Type:   runtime.NetworkReady,
 		Status: true,
-	}
-
-	// Load the latest cni configuration to be in sync with the latest network configuration
-	if err := c.netPlugin.Load(cni.WithLoNetwork, cni.WithDefaultConf); err != nil {
-		log.G(ctx).WithError(err).Errorf("Failed to load cni configuration")
 	}
 	// Check the status of the cni initialization
 	if err := c.netPlugin.Status(); err != nil {
@@ -78,6 +72,12 @@ func (c *criService) Status(ctx context.Context, r *runtime.StatusRequest) (*run
 			log.G(ctx).WithError(err).Errorf("Failed to marshal CNI config %v", err)
 		}
 		resp.Info["cniconfig"] = string(cniConfig)
+
+		lastCNILoadStatus := "OK"
+		if lerr := c.cniNetConfMonitor.lastStatus(); lerr != nil {
+			lastCNILoadStatus = lerr.Error()
+		}
+		resp.Info["lastCNILoadStatus"] = lastCNILoadStatus
 	}
 	return resp, nil
 }

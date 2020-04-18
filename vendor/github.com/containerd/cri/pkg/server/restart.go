@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"time"
 
 	"github.com/containerd/containerd"
@@ -29,7 +30,6 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/typeurl"
-	"github.com/docker/docker/pkg/system"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
@@ -307,7 +307,9 @@ func (c *criService) loadContainer(ctx context.Context, cntr containerd.Containe
 	}()
 	if err != nil {
 		log.G(ctx).WithError(err).Errorf("Failed to load container status for %q", id)
-		status = unknownContainerStatus()
+		// Only set the unknown field in this case, because other fields may
+		// contain useful information loaded from the checkpoint.
+		status.Unknown = true
 	}
 	opts := []containerstore.Opts{
 		containerstore.WithStatus(status, containerDir),
@@ -407,7 +409,8 @@ func (c *criService) loadSandbox(ctx context.Context, cntr containerd.Container)
 	sandbox.Container = cntr
 
 	// Load network namespace.
-	if meta.Config.GetLinux().GetSecurityContext().GetNamespaceOptions().GetNetwork() == runtime.NamespaceMode_NODE {
+	if goruntime.GOOS != "windows" &&
+		meta.Config.GetLinux().GetSecurityContext().GetNamespaceOptions().GetNetwork() == runtime.NamespaceMode_NODE {
 		// Don't need to load netns for host network sandbox.
 		return sandbox, nil
 	}
@@ -470,7 +473,7 @@ func cleanupOrphanedIDDirs(ctx context.Context, cntrs []containerd.Container, ba
 			continue
 		}
 		dir := filepath.Join(base, d.Name())
-		if err := system.EnsureRemoveAll(dir); err != nil {
+		if err := ensureRemoveAll(ctx, dir); err != nil {
 			log.G(ctx).WithError(err).Warnf("Failed to remove id directory %q", dir)
 		} else {
 			log.G(ctx).Debugf("Cleanup orphaned id directory %q", dir)
